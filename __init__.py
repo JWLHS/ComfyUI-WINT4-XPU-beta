@@ -1,41 +1,20 @@
 """
-WINT4 Model Quantizer + Loader
-───────────────────────────────
-Standalone INT4 per-row model quantization & loading for ComfyUI.
-Packed uint8 storage (2×4bit per byte).
+WINT4 Model Quantizer + Loader + LoRA
+─────────────────────────────────────
+Standalone INT4 per-row model quantization, loading & LoRA for ComfyUI.
 
-Two nodes:
-  WINT4ModelQuantizer  → offline per-row INT4 quantization
-                         (BF16/FP16/FP8/INT8 → INT4 packed uint8)
-  WINT4ModelLoader     → load INT4 models with VRAM savings
-
-Supports: BF16, FP16, FP8, INT8 input models
-QuaRot: optional Hadamard rotation for better quality
-AIMDO: compatible (auto-detect, dual path)
-LoRA: NOT supported on INT4 packed layers (excluded layers work)
-
-Pure PyTorch — no CUDA, no external dependencies beyond ComfyUI itself.
-Works on CPU / CUDA / XPU / any PyTorch backend.
+Nodes:
+  WINT4ModelQuantizer  → UNet BF16/FP16/FP8/INT8 → INT4 packed uint8
+  WINT4ModelLoader     → load INT4 UNet
+  WINT4LoRALoader      → single LoRA for INT4 UNet
+  WINT4LoRAStack       → multi-LoRA for INT4 UNet
 """
 
-from .wint4_model_quantizer import (
-    NODE_CLASS_MAPPINGS as _QUANT_MAPPINGS,
-    NODE_DISPLAY_NAME_MAPPINGS as _QUANT_DISPLAY,
-)
+from .wint4_model_quantizer import NODE_CLASS_MAPPINGS as _Q, NODE_DISPLAY_NAME_MAPPINGS as _QD
+from .wint4_model_loader import NODE_CLASS_MAPPINGS as _L, NODE_DISPLAY_NAME_MAPPINGS as _LD
+from .wint4_lora_loader import NODE_CLASS_MAPPINGS as _LR, NODE_DISPLAY_NAME_MAPPINGS as _LRD
+from .wint4_lora_stack import NODE_CLASS_MAPPINGS as _LS, NODE_DISPLAY_NAME_MAPPINGS as _LSD
 
-from .wint4_model_loader import (
-    NODE_CLASS_MAPPINGS as _LOAD_MAPPINGS,
-    NODE_DISPLAY_NAME_MAPPINGS as _LOAD_DISPLAY,
-)
-
-NODE_CLASS_MAPPINGS = {
-    **_QUANT_MAPPINGS,
-    **_LOAD_MAPPINGS,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    **_QUANT_DISPLAY,
-    **_LOAD_DISPLAY,
-}
-
+NODE_CLASS_MAPPINGS = {**_Q, **_L, **_LR, **_LS}
+NODE_DISPLAY_NAME_MAPPINGS = {**_QD, **_LD, **_LRD, **_LSD}
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

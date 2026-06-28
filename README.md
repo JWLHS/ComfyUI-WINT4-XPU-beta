@@ -1,61 +1,39 @@
-```markdown
-# WINT4 XPU INT4 量化插件 — 实验版
 
-> **⚠️ 实验版 (Beta)**：功能正常但尚未经过全面测试。当前版本 **不支持 LoRA**（详见[已知限制](#已知限制)）。
->
-> 如需 LoRA + 量化 → 使用 [ComfyUI-WINT8-XPU](https://github.com/JWLHS/ComfyUI-WINT8-XPU)
 
 ---
 
-## 目录
+## `README.md`
 
-1. [功能概览](#功能概览)
-2. [安装](#安装)
-3. [节点详解](#节点详解)
-   - [WINT4 Model Quantizer](#wint4-model-quantizer)
-   - [WINT4 Model Loader](#wint4-model-loader)
-4. [INT4 vs INT8 对比](#int4-vs-int8-对比)
-5. [AIMDO DynamicVRAM 使用建议](#aimdo-dynamicvram-使用建议)
-6. [完整工作流](#完整工作流)
-7. [支持模型](#支持模型)
-8. [常见问题](#常见问题)
-9. [已知限制](#已知限制)
-10. [文件清单](#文件清单)
-11. [相关链接](#相关链接)
+```markdown
+# ComfyUI-WINT4-XPU-beta
+
+> **INT4 per-row 模型量化与 LoRA 推理插件 — 专为 Intel Arc A770 16GB 优化**
+
+将扩散模型量化为 **per-row INT4 (packed uint8)**，显存节省 75%，在 A770 上裸跑 Krea2 1024×1024 出图仅需 **~8–9 GB**。
+**现已支持多 LoRA 叠加**，通过自建加载链路绕过 INT4 packed shape 约束。
 
 ---
 
 ## 功能概览
 
-将 **BF16 / FP16 / FP8 / INT8** 扩散模型量化为 **per-row INT4（packed uint8）**：
+| 能力 | 状态 |
+|------|:--:|
+| BF16/FP16/FP8/INT8 → INT4 量化 | ✅ |
+| QuaRot (Hadamard 旋转) 质量提升 | ✅ |
+| INT4 UNet 推理 (AIMDO 双路径) | ✅ |
+| 单 LoRA 加载 | ✅ |
+| 多 LoRA 叠加 (串联 / Stack) | ✅ |
+| 7 种 LoRA key 格式自动适配 | ✅ |
+| TE 量化 | ❌ 已放弃 (26 层级联误差致黑图) |
 
-| 指标 | 效果 |
-|------|------|
-| **显存（存储）** | ~25% of BF16（≈6 GB vs 24 GB） |
-| **推理显存 (Krea2 1024×1024)** | ~8–9 GB |
-| **推理速度** | 接近 INT8，明显快于 BF16 原版 |
-| **画质** | 正常，无花屏 |
-| **加载** | < 2 秒 |
-| **AIMDO** | ✅ 兼容（自动检测，双路径） |
-| **LoRA** | ❌ 当前不支持 |
+### 性能数据 (Krea2)
 
-### 原理
-
-```
-量化阶段：                 推理阶段：
-                            
-BF16/INT8 权重              packed uint8 (out_f, in_f//2)
-    │                           │
-    ▼                           ▼
-amax / 7 = scale            AIMDO: cast_bias_weight → XPU
-round → [-8,7]              无 AIMDO: 局部变量 → XPU
-pack → uint8                     │
-    │                           ▼
-    ▼                       unpack → 解出 2 路 4-bit
-safetensors                  → fp16 dequant
-                            → F.linear
-                            → empty_cache() 回收
-```
+| 指标 | BF16 | INT8 | INT4 |
+|------|:--:|:--:|:--:|
+| UNet 存储 | 24 GB | 12 GB | **6 GB** |
+| 推理显存 | ~24 GB | ~16–17 GB | **~8–9 GB** |
+| A770 16GB 裸跑 | ❌ | ❌ | ✅ |
+| LoRA | ✅ | ✅ 原生 | ✅ 自建 |
 
 ---
 
@@ -66,127 +44,77 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/JWLHS/ComfyUI-WINT4-XPU-beta.git
 ```
 
-依赖同 INT8 插件（`convert-to-quant` + `safetensors`），ComfyUI 启动时自动安装。
+依赖同 INT8 插件，ComfyUI 启动时自动安装。
 
 ---
 
-## 节点详解
+## 节点
 
----
-
-### WINT4 Model Quantizer
-
-**位置：** `WINT4` → `WINT4 Model Quantizer`
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|:---:|------|
-| `model_name` | 下拉 | — | BF16/FP16/FP8/INT8 模型 |
-| `model_type` | 下拉 | `flux2` | 架构类型，控制排除列表 |
-| `enable_quarot` | 开关 | `False` | Hadamard 旋转，提升质量 |
-| `group_size` | 整数 | `128` | QuaRot 分组大小 |
-| `device` | 下拉 | `xpu` | 量化计算设备 |
-| `output_filename` | 文本 | `model_int4` | 输出至 `ComfyUI/output/` |
-
-#### 支持的输入格式
-
-| 输入 dtype | 处理方式 |
-|:---|------|
-| BF16 / FP16 / FP32 | 直接 → float32 → INT4 |
-| FP8 | `.float()` → float32 → INT4 |
-| **INT8** | 读取 `weight_scale` 反量化 → float32 → INT4 |
-
-#### QuaRot (enable_quarot)
-
-勾选后对每组权重应用 Hadamard 正交旋转，将浮点 outlier 均匀分散 → 量化误差更低。`group_size` 需整除 `in_features`。
-
----
-
-### WINT4 Model Loader
-
-**位置：** `WINT4` → `WINT4 Model Loader`
-
-| 参数 | 类型 | 默认值 | 说明 |
-|------|------|:---:|------|
-| `unet_name` | 下拉 | — | INT4 量化后的 `.safetensors` |
-| `model_type` | 下拉 | `flux2` | **必须和量化时一致** |
-
-输出 `MODEL`，可直接接入 KSampler。
-
----
-
-## INT4 vs INT8 对比
-
-| | INT8 | INT4 |
-|---|---|---|
-| **存储 vs BF16** | 50% | **25%（再省一半）** |
-| **推理显存 (Krea2)** | ~16-17 GB | **~8-9 GB** |
-| **A770 16GB 能否裸跑** | ❌ 常超 | ✅ 够 |
-| **推理速度** | ≈ BF16 | 接近 INT8 |
-| **模型输入** | BF16/FP16/FP8 | BF16/FP16/FP8/**INT8** |
-| **AIMDO** | ✅ | ✅ |
-| **LoRA** | ✅ | ❌ |
-| **QuaRot** | ✅ (builtin) | ✅ |
-| **ctq** | ✅ (auto/ctq) | ❌ |
-
----
-
-## AIMDO DynamicVRAM 使用建议
-
-| 场景 | 建议 |
+| 节点 | 功能 |
 |------|------|
-| INT4 裸跑 (A770 16GB) | **关 AIMDO** — 8-9 GB 够用 |
-| INT4 + 大分辨率 | 开 AIMDO — 自动检测，走闭环 |
-| BF16 原版 | 用 INT8 插件 + AIMDO |
-
-AIMDO 开启时：`cast_bias_weight` → unpack → dequant → `uncast_bias_weight`，共享显存正常释放。
+| `WINT4ModelQuantizer` | 量化 UNet → INT4 packed uint8 + QuaRot |
+| `WINT4ModelLoader` | 加载 INT4 UNet |
+| `WINT4LoRALoader` | 单 LoRA，支持链式串联 (自动累加) |
+| `WINT4LoRAStack` | 多 LoRA 一次叠加 (最多 5 个) |
 
 ---
 
-## 完整工作流
+## 快速开始
 
 ```
 1. 量化:
-   WINT4ModelQuantizer:
-     model_name      = BF16 / INT8 模型
-     model_type      = krea2 / flux2 / ...
-     device          = xpu
-     output_filename = my_model_int4
+   WINT4ModelQuantizer
+   ├─ model_name      = 你的 BF16/FP16/INT8 模型
+   ├─ model_type      = krea2 / flux2 / ...
+   ├─ device          = xpu
+   └─ output_filename = my_model_int4
 
-2. 推理:
-   WINT4ModelLoader (unet_name + model_type) → MODEL
-   XPU AIMDO Status: Enable_DynamicVRAM = OFF (推荐)
-   KSampler → VAE Decode → 出图
+2. 推理 (无 LoRA):
+   WINT4ModelLoader → MODEL → KSampler → VAE Decode
+
+3. 推理 (单 LoRA):
+   WINT4ModelLoader → WINT4LoRALoader (挂 1 个 LoRA) → KSampler
+
+4. 推理 (多 LoRA 串联):
+   WINT4ModelLoader → WINT4LoRALoader (LoRA 1) → WINT4LoRALoader (LoRA 2) → KSampler
+
+5. 推理 (多 LoRA Stack):
+   WINT4ModelLoader → WINT4LoRAStack (5 槽位) → KSampler
 ```
+
+LoRA 强度建议 **1.5–2.0×** (INT4 反量化精度损失可能让 LoRA 效果变弱)。
 
 ---
 
-## 支持模型
+## LoRA 支持详情
 
-与 INT8 插件共享相同的排除列表（从 convert-to-quant 同步）：
+### 为什么需要自建加载器
 
-```
-flux2   z-image   chroma   wan   ltx2
-qwen    ernie    hidream   boogu
-krea2   ideogram4   auto
-```
+INT4 权值的物理 shape 是 `(out_f, in_f // 2)` — 2 个 4-bit 值 packed 成 1 个 uint8。LoRA 需要 `(out_f, in_f)` 完整 shape。ComfyUI 原生 `load_lora` 走 `state_dict()` 建 key 映射，INT4 层的 packed shape 导致匹配失败。假 weight 方案又会触发 `model_patcher` 按 `numel()` 分配全量 VRAM → OOM。
 
-排除层（保持 BF16/FP16）：`img_in`、`txt_in`、`final_layer`、`adaLN`、`norm_*`、`patch_embedding` 等。
+### 方案
 
----
+绕过 ComfyUI 原生 `load_lora`，直接读 LoRA safetensors → 解析 `lora_A`/`lora_B` (或 `lora_up`/`lora_down`) → 匹配 INT4 量化层 → 存储原始矩阵 (A=down, B=up) 在 XPU 上 → forward 时动态算 `delta = B @ A` 并原地加到 `w_dq`。
 
-## 常见问题
+### 支持的 LoRA key 格式
 
-### Q: 加载时看到 `[WARNING] unet unexpected: ['int4_model_type', 'int4_quantized', ...]`？
+| # | 格式 | 示例 |
+|:-:|------|------|
+| ① | Kohya 标准 | `diffusion_model.blocks.0.attn.wq.lora_B.weight` |
+| ② | diffusers/simpletrainer | `transformer.blocks.0.attn.to_q.lora_B.weight` |
+| ③ | SimpleTuner lycoris | `lycoris_blocks_0_attn_wq.lora_down.weight` |
+| ④ | bare (无前缀) | `blocks.0.attn.wq.lora_B.weight` |
+| ⑤ | onetrainer | `transformer.text_fusion.layerwise_blocks.0.attn.to_q.lora_B.weight` |
+| ⑥ | legacy ComfyUI | `lora_unet_blocks_0_attn_wq.lora_down.weight` |
+| ⑦ | onetrainer alt | `lora_transformer_blocks_0_attn_wq.lora_down.weight` |
+| ⑧ | BFL | `single_blocks.0.attn.qkv.lora_A.weight` → 自动转换 |
 
-**A:** 正常。元数据 key 不被模型消费，无害。
+后缀 `lora_B`/`lora_A` 和 `lora_up`/`lora_down` 均支持。`to_q`→`wq`, `to_k`→`wk`, `to_v`→`wv`, `to_out`→`wo`, `to_gate`→`gate`, `ff`→`mlp` 自动映射。
 
-### Q: INT8 → INT4 量化后文件体积差多少？
+### 多 LoRA 叠加策略
 
-**A:** INT8 12GB → INT4 ~6GB，体积减半。量化器自动读 INT8 的 `weight_scale` 反量化，无需手动操作。
-
-### Q: 能和 LoRA 一起用吗？
-
-**A:** 不能。INT4 packed shape（`out_f, in_f//2`）与 LoRA 期望的完整 shape 不兼容。INT4 层会打印 ERROR 但推理正常。排除层（first/last/norm）仍可用 LoRA。
+- 同层多个 LoRA, **shape 相同** → 累加成 1 个 delta (单次矩阵加)
+- 同层多个 LoRA, **shape 不同** → 各自独立存储, forward 分别生效
 
 ---
 
@@ -194,22 +122,107 @@ krea2   ideogram4   auto
 
 | 限制 | 说明 |
 |------|------|
-| **LoRA 不支持** | 当前 INT4 层不做 LoRA，排除层（first/last/norm）除外 |
-| **仅 builtin 模式** | 不支持 ctq（ctq 没有 INT4 路径） |
-| **排除层保持原精度** | first/last/norm 等不量化，推理时用更大显存 |
-| **large resolution 需 AIMDO** | 超大分辨率建议开 AIMDO DynamicVRAM |
+| QuaRot + LoRA 不兼容 | LoRA delta 在未旋转空间, 加到旋转后的权值数学不对 |
+| 仅 builtin 模式 | 不支持 ctq |
+| TE 不量化 | INT4 TE 26 层级联误差致黑图, INT8 TE 出图仍黑, 已放弃 |
+| 排除层保持原精度 | first/last/norm/adaLN 等不量化 |
+
+---
+
+## 项目演进
+
+### 阶段 1: INT4 量化与推理 (2025-06)
+
+- per-row INT4 量化 (amax/7, packed uint8)
+- AIMDO 双路径 (开/关自动检测)
+- QuaRot 支持
+
+### 阶段 2: LoRA 加载 — 硬墙 (2025-06)
+
+**遇到的核心矛盾:** INT4 pack shape `(out_f, in_f//2)` vs LoRA 需要 `(out_f, in_f)` — 物理不可兼得。
+
+**尝试过的方案 (均失败):**
+- 假 weight (`torch.empty(out_f, in_f)`) → `model_patcher.load()` 按 `numel()×element_size()` 分配 VBAR → 16+ GB VRAM OOM
+- `as_strided` 幽灵张量 → `numel()` 仍返回完整值 → VBAR 仍 OOM
+- `object.__setattr__` 隐藏 weight → `model_patcher.load()` 需要 `module.weight` 存在 → 崩溃
+- 第一次 forward 时 swap → LoRA Manager 加载阶段就做 shape 检查 → 时机太晚
+
+### 阶段 3: 自建 LoRA 加载器 (2025-06-28–29)
+
+- 绕过 ComfyUI 原生 `load_lora`，直接读 safetensors
+- 解析 `lora_up`/`lora_down` → 计算 `delta = up @ down` → 存入 `_lora_delta`
+- **Bug:** 只匹配 `lora_up`/`lora_down`，Krea2 LoRA 用 `lora_A`/`lora_B` → 0 层匹配
+- **修复:** 加 `lora_A`/`lora_B` 支持
+
+### 阶段 4: 多格式适配 (2025-06-29)
+
+- 7 种 LoRA key 格式统一 normalize
+- 对照 ComfyUI 源码 `model_lora_keys_unet` 补齐所有路径
+- `_normalize_layer_path()` 统一处理前缀、后缀、分隔符
+
+### 阶段 5: 内存优化 (2025-06-29)
+
+**问题:** 两个 LoRA 推理阶段 CPU 内存从 20GB 涨到 40–60GB, CPU 满载。
+
+**根因分析:**
+- delta 预展开 → 每层 18.9 MB fp16 → 两个 LoRA ≈ 8.5 GB
+- 改为存原始 A/B 矩阵 (每层 ~600 KB → 两个 LoRA ≈ 211 MB)
+- 但 A/B 存在 CPU, forward 每次 `.to(xpu)` 触发 Intel XPU 驱动分配 pinned staging buffer
+- 224 层 × 20 steps × 2 次搬运 = 8960 次 staging buffer 分配, 驱动不归还 → 内存泄漏
+
+**最终方案:**
+- A/B 直接存在 XPU (fp16, ~200 MB 总量)
+- Forward 里 `B @ A` 零 CPU→XPU 搬运
+- 内存恢复正常
+
+### 阶段 6: 代码清理 (2025-06-29)
+
+- 删除 `wint4_xpu_ops.py` 中 89 行 Triton 死代码 (纯 PyTorch impl, 无 Triton kernel)
+- 抽取 `wint4_lora_common.py` 消除 Loader/Stack 间 100 行重复
+
+---
+
+## Bug 修复记录
+
+| # | Bug | 修复 |
+|---|------|------|
+| 1 | 花屏 | key 命名对齐 |
+| 2 | 偏色 | 排除列表同步 ctq |
+| 3 | 元数据不识别 | 双读 quarot/convrot |
+| 4 | 缺 input_scale | 量化器写入 |
+| 5 | unexpected key | `object.__setattr__` 绕过 nn.Module |
+| 6 | bias device mismatch | `.to(device=x.device)` |
+| 7 | 循环导入 | import 移方法内 |
+| 8 | ops 被覆盖 | 恢复 Int4XPUOps |
+| 9 | AIMDO 显存泄漏 | cast/uncast 闭环 + empty_cache |
+| 10 | `quint4x2` 创建失败 | uint8 手动 pack |
+| 11 | `bitwise_and_xpu` BFloat16 | `weight.to(torch.uint8)` |
+| 12 | 假 weight VBAR OOM | 放弃, 改 `_lora_entries` |
+| 13 | `load_text_encoder` 不存在 | → `load_clip(ckpt_paths=[...])` |
+| 14 | TE embed/lm_head shape mismatch | 通用 `_SKIP_KEYWORDS` |
+| 15 | swap 方案 Linear 无 weight | 放弃 swap |
+| 16 | `MODEL_TYPES` ImportError | 恢复正确文件 |
+| 17 | `clip_type` 传字符串无效 | 映射到 `CLIPType` 枚举 |
+| 18 | INT4 TE 26 层级联 → 黑图 | TE 改用 INT8 (后也放弃) |
+| 19 | LoRA 匹配 0 层 | 加 `lora_A`/`lora_B` 支持 |
+| 20 | delta 矩阵乘法 shape 错误 | A/B 的 up/down 角色对调 |
+| 21 | 不同 LoRA shape 累加崩溃 | 列表独立存储 |
+| 22 | CPU 内存 40–60 GB + 满载 | A/B 存 XPU, 零搬运 |
 
 ---
 
 ## 文件清单
 
 ```
-ComfyUI-WINT4-XPU/
-├── __init__.py                  # 节点注册
-├── wint4_model_quantizer.py     # 量化（BF16/FP16/FP8/INT8 → INT4 + QuaRot）
-├── wint4_model_loader.py        # 加载
-├── wint4_xpu_ops.py             # 推理 ops（AIMDO 双路径 + fp16 unpack）
-├── wint8_quarot.py              # Hadamard 旋转（与 INT8 共享）
+ComfyUI-WINT4-XPU-beta/
+├── __init__.py                  # 节点注册 (4 节点)
+├── wint4_model_quantizer.py     # 量化 (BF16/FP16/FP8/INT8 → INT4 + QuaRot)
+├── wint4_model_loader.py        # 加载 INT4 UNet
+├── wint4_xpu_ops.py             # 推理 ops (AIMDO 双路径 + LoRA delta)
+├── wint4_lora_loader.py         # 单 LoRA 加载 (自建链路)
+├── wint4_lora_stack.py          # 多 LoRA 一次叠加 (最多 5 个)
+├── wint4_lora_common.py         # 共享: key 格式归一化函数
+├── wint8_quarot.py              # Hadamard 旋转
 ├── requirements.txt
 ├── README.md
 ├── LICENSE
@@ -218,11 +231,21 @@ ComfyUI-WINT4-XPU/
 
 ---
 
-## 相关链接
+## 未来展望
 
-- **本插件 (INT4)**：https://github.com/JWLHS/ComfyUI-WINT4-XPU-beta
-- **INT8 插件**：https://github.com/JWLHS/ComfyUI-WINT8-XPU
-```
+| 优先级 | 方向 | 说明 |
+|:---:|------|------|
+| 🟡 | LoRA Unloader 节点 | 手动释放 `_lora_entries`, 供 session 内切换 LoRA |
+| 🟡 | QuaRot + LoRA 兼容 | delta 量化时同步旋转 `delta @ H^T`, 解决数学不兼容 |
+| 🟢 | INT4 TE 重试 | 视觉层排除 + 低精度层混合, 缓解 26 层级联误差 |
+| 🟢 | FB Cache | hook Krea2 first block 前向, 缓存跳过 |
+| 🟢 | PR 给 ComfyUI | `model_patcher.py` 一行让 uint8 参数按实际字节分配 VRAM |
+| 🔵 | OpenVINO 调研 | 看 `comfyui-openvino` 源码能否对接 |
 
 ---
 
+## 相关链接
+
+- **本插件**: https://github.com/JWLHS/ComfyUI-WINT4-XPU-beta
+- **INT8 插件**: https://github.com/JWLHS/ComfyUI-WINT8-XPU
+```

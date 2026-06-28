@@ -4,115 +4,25 @@ wint4_xpu_ops.py
 INT4 custom operations for Intel XPU (Arc A770).
 
 Packed INT4 inference (uint8 storage, 2×4bit per byte):
-  - weight: (out_f, in_f // 2) uint8, 偶数列低4位/奇数列高4位
+  - weight: (out_f, in_f // 2) uint8
   - weight_scale: (out_f, 1) float32
   - unpack → dequant → F.linear
 
-When AIMDO DynamicVRAM is ON:  uses cast_bias_weight / uncast_bias_weight.
-When AIMDO DynamicVRAM is OFF: local-variable device alignment,
-  self.weight always stays on CPU, VRAM released after forward.
-
-LoRA: NOT supported on INT4 packed layers (shape mismatch unavoidable).
-      Excluded layers (first/last/norm) stay BF16 and LoRA works on those.
+LoRA: via _lora_entries list of (A, B, multiplier) tuples.
+A = down projection (rank, in_f), B = up projection (out_f, rank).
+Stored on XPU.  Forward computes delta = B @ A on-the-fly.
 """
 
-import os
 import json
 import logging
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
 log = logging.getLogger("WINT4-XPU")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Environment setup
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_TRITON_AVAILABLE = False
-
-
-def _try_add_dll_search_paths():
-    candidates = []
-    try:
-        import folder_paths
-        base = folder_paths.base_path
-        if base:
-            candidates.append(os.path.join(base, ".ext", "Library", "bin"))
-    except Exception:
-        pass
-    try:
-        here = os.path.dirname(os.path.abspath(__file__))
-        rel = os.path.normpath(os.path.join(here, "..", "..", "..", ".ext", "Library", "bin"))
-        candidates.append(rel)
-    except Exception:
-        pass
-    for p in candidates:
-        if os.path.isdir(p):
-            try:
-                os.add_dll_directory(p)
-            except Exception:
-                pass
-
-
-def _find_oneapi_2025():
-    base = r"C:\Program Files (x86)\Intel\oneAPI\compiler"
-    if not os.path.isdir(base):
-        return None
-    versions = []
-    for e in os.listdir(base):
-        full = os.path.join(base, e)
-        if os.path.isdir(full) and e.startswith("2025."):
-            if os.path.isfile(os.path.join(full, "bin", "icpx.exe")):
-                versions.append(e)
-    versions.sort(reverse=True)
-    return os.path.join(base, versions[0]) if versions else None
-
-
-def _patch_compilation_helper():
-    global _TRITON_AVAILABLE
-    try:
-        from triton.backends.intel.driver import COMPILATION_HELPER
-    except ImportError:
-        return
-    oneapi_dir = _find_oneapi_2025()
-    if oneapi_dir is None:
-        return
-    level_zero_dir = r"C:\Program Files\LevelZeroSDK\1.28.2"
-    triton_dir = os.path.dirname(triton.__file__)
-    triton_inc = os.path.join(triton_dir, "backends", "intel", "include")
-    triton_lib = os.path.join(triton_dir, "backends", "intel", "lib")
-    COMPILATION_HELPER.include_dir = [
-        triton_inc,
-        os.path.join(oneapi_dir, "include"),
-        os.path.join(oneapi_dir, "include", "sycl"),
-        os.path.join(level_zero_dir, "include"),
-    ]
-    COMPILATION_HELPER.library_dir = [
-        triton_lib,
-        os.path.join(oneapi_dir, "lib"),
-        os.path.join(level_zero_dir, "lib"),
-    ]
-    icpx_bin = os.path.join(oneapi_dir, "bin")
-    if os.path.isdir(icpx_bin) and icpx_bin not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = icpx_bin + os.pathsep + os.environ.get("PATH", "")
-    log.info(f"WINT4-XPU: Triton compilation locked to {oneapi_dir}")
-
-
-_try_add_dll_search_paths()
-_patch_compilation_helper()
-
-try:
-    _TRITON_AVAILABLE = True
-    log.info("WINT4-XPU: Triton XPU available")
-except ImportError:
-    log.info("WINT4-XPU: Triton not available")
-
 
 def _aimdo_active() -> bool:
-    """Check if AIMDO DynamicVRAM is currently enabled."""
     try:
         from comfy_aimdo import control as _ctrl
         return _ctrl.is_dynamic_vram_enabled()
@@ -166,7 +76,6 @@ if _COMFY_OPS:
                     missing_keys.append(weight_key)
                     self._is_quantized = False
                 elif weight_tensor.dtype == torch.uint8 and weight_scale is not None:
-                    # INT4 packed: (out_f, in_f // 2) uint8
                     Int4XPUOps._is_prequantized = True
                     self._is_quantized = True
                     self.weight = torch.nn.Parameter(weight_tensor, requires_grad=False)
@@ -228,6 +137,8 @@ if _COMFY_OPS:
                 )
                 result = self._compute(x, weight, bias, need_cast)
                 uncast_bias_weight(self, weight, bias, offload_stream)
+                if x.device.type == 'xpu':
+                    torch.xpu.empty_cache()
                 return result
 
             def _forward_simple(self, x, need_cast):
@@ -268,6 +179,25 @@ if _COMFY_OPS:
                 else:
                     w_dq = w_unpacked.mul(w_scale).to(comp_dtype)
                 del w_unpacked
+
+                # ── WINT4 LoRA: delta = B @ A on XPU ──────────────
+                # _lora_entries = list of (A, B, multiplier)
+                #   A = down projection (rank, in_f), fp16, XPU
+                #   B = up projection (out_f, rank), fp16, XPU
+                lora_entries = getattr(self, '_lora_entries', None)
+                if lora_entries is not None:
+                    for A, B, multiplier in lora_entries:
+                        if A.shape[1] == w_dq.shape[1]:
+                            # Cast dtype if needed; move to current device
+                            A_dev = A if A.dtype == comp_dtype else A.to(dtype=comp_dtype)
+                            B_dev = B if B.dtype == comp_dtype else B.to(dtype=comp_dtype)
+                            if A_dev.device != w_dq.device:
+                                A_dev = A_dev.to(device=w_dq.device)
+                            if B_dev.device != w_dq.device:
+                                B_dev = B_dev.to(device=w_dq.device)
+                            delta = B_dev @ A_dev
+                            delta.mul_(multiplier)
+                            w_dq.add_(delta)
 
                 b_dq = bias.to(device=x.device, dtype=comp_dtype) if bias is not None else None
 
