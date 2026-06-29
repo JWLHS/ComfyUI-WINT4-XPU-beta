@@ -8,19 +8,16 @@ Packed INT4 inference (uint8 storage, 2×4bit per byte):
   - weight_scale: (out_f, 1) float32
   - unpack → dequant → F.linear
 
-LoRA: via _lora_entries list of (A, B, multiplier) tuples.
+LoRA: via _lora_entries dict {lora_name: [(A,B,multiplier[,start,end]), ...]}.
 A = down projection (rank, in_f), B = up projection (out_f, rank).
 Stored on XPU.  Forward computes delta = B @ A on-the-fly.
 """
-
 import json
 import logging
-
 import torch
 import torch.nn.functional as F
 
 log = logging.getLogger("WINT4-XPU")
-
 
 def _aimdo_active() -> bool:
     try:
@@ -28,11 +25,6 @@ def _aimdo_active() -> bool:
         return _ctrl.is_dynamic_vram_enabled()
     except Exception:
         return False
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ComfyUI custom operations
-# ═══════════════════════════════════════════════════════════════════════════════
 
 try:
     from comfy.ops import manual_cast, cast_bias_weight, uncast_bias_weight
@@ -80,7 +72,6 @@ if _COMFY_OPS:
                     self._is_quantized = True
                     self.weight = torch.nn.Parameter(weight_tensor, requires_grad=False)
                     self.register_buffer("weight_scale", weight_scale.float())
-
                     if meta_raw is not None:
                         try:
                             meta = json.loads(bytes(meta_raw.tolist()).decode("utf-8"))
@@ -90,12 +81,9 @@ if _COMFY_OPS:
                                 gs = meta.get("group_size", meta.get("convrot_groupsize", 128))
                                 self._group_size = gs
                                 from .wint8_quarot import build_hadamard
-                                self._hadamard_H = build_hadamard(
-                                    gs, device="cpu", dtype=torch.float32
-                                )
+                                self._hadamard_H = build_hadamard(gs, device="cpu", dtype=torch.float32)
                         except Exception:
                             pass
-
                 elif weight_tensor.dtype in (torch.float16, torch.bfloat16, torch.float32):
                     self._is_quantized = False
                     self.weight = torch.nn.Parameter(weight_tensor, requires_grad=False)
@@ -115,26 +103,20 @@ if _COMFY_OPS:
                     or len(getattr(self, 'weight_function', [])) > 0
                     or len(getattr(self, 'bias_function', [])) > 0
                 )
-
                 if not self._is_quantized:
                     if need_cast:
-                        weight, bias, offload_stream = cast_bias_weight(
-                            self, x, offloadable=True,
-                        )
+                        weight, bias, offload_stream = cast_bias_weight(self, x, offloadable=True)
                         out = F.linear(x, weight, bias)
                         uncast_bias_weight(self, weight, bias, offload_stream)
                         return out
                     return F.linear(x, self.weight, self.bias)
-
                 if _aimdo_active():
                     return self._forward_aimdo(x, need_cast)
                 else:
                     return self._forward_simple(x, need_cast)
 
             def _forward_aimdo(self, x, need_cast):
-                weight, bias, offload_stream = cast_bias_weight(
-                    self, x, offloadable=True,
-                )
+                weight, bias, offload_stream = cast_bias_weight(self, x, offloadable=True)
                 result = self._compute(x, weight, bias, need_cast)
                 uncast_bias_weight(self, weight, bias, offload_stream)
                 if x.device.type == 'xpu':
@@ -181,23 +163,32 @@ if _COMFY_OPS:
                 del w_unpacked
 
                 # ── WINT4 LoRA: delta = B @ A on XPU ──────────────
-                # _lora_entries = list of (A, B, multiplier)
-                #   A = down projection (rank, in_f), fp16, XPU
-                #   B = up projection (out_f, rank), fp16, XPU
+                # _lora_entries = dict { lora_name: [(A,B,mult,...), ...] }
                 lora_entries = getattr(self, '_lora_entries', None)
                 if lora_entries is not None:
-                    for A, B, multiplier in lora_entries:
-                        if A.shape[1] == w_dq.shape[1]:
-                            # Cast dtype if needed; move to current device
-                            A_dev = A if A.dtype == comp_dtype else A.to(dtype=comp_dtype)
-                            B_dev = B if B.dtype == comp_dtype else B.to(dtype=comp_dtype)
+                    for entries_list in lora_entries.values():
+                        for entry in entries_list:
+                            A, B, multiplier = entry[:3]
+                            sl_start = entry[3] if len(entry) > 3 else None
+                            sl_end   = entry[4] if len(entry) > 4 else None
+
+                            if A.shape[1] != w_dq.shape[1]:
+                                continue
+
+                            A_dev = A.to(dtype=comp_dtype) if A.dtype != comp_dtype else A
+                            B_dev = B.to(dtype=comp_dtype) if B.dtype != comp_dtype else B
                             if A_dev.device != w_dq.device:
                                 A_dev = A_dev.to(device=w_dq.device)
                             if B_dev.device != w_dq.device:
                                 B_dev = B_dev.to(device=w_dq.device)
+
                             delta = B_dev @ A_dev
                             delta.mul_(multiplier)
-                            w_dq.add_(delta)
+
+                            if sl_start is not None:
+                                w_dq[sl_start:sl_end, :].add_(delta)
+                            else:
+                                w_dq.add_(delta)
 
                 b_dq = bias.to(device=x.device, dtype=comp_dtype) if bias is not None else None
 
@@ -210,7 +201,6 @@ if _COMFY_OPS:
 
                 out = F.linear(x2.to(comp_dtype), w_dq, b_dq)
                 del w_dq
-
                 return out.reshape(*x.shape[:-1], out.shape[-1])
 
         class GroupNorm(manual_cast.GroupNorm):

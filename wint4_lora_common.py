@@ -3,54 +3,61 @@ wint4_lora_common.py
 ────────────────────
 Shared LoRA key normalization utilities for WINT4 LoRA nodes.
 Used by both WINT4LoRALoader and WINT4LoRAStack.
+
+_normalize_layer_path maps ANY LoRA key OR model internal module name
+to a single canonical form:  diffusion_model.blocks.N.attn.wq
+
+This means model internal names and LoRA keys are normalized to the
+SAME space, and matching is exact string comparison after normalization.
 """
 
 
 def _normalize_layer_path(path: str) -> str | None:
-    """
-    Normalize any LoRA layer path to standard diffusion_model.blocks.N.attn.wq format.
-
-    Handles:
-      PREFIX  — transformer.*, blocks.*, lora_unet_*, lycoris_*, lora_transformer_*
-      SUFFIX  — .to_q→.wq  .to_k→.wk  .to_v→.wv  .to_out.0→.wo  .to_gate→.gate
-      BLOCK   — .ff.→.mlp.
-      SEP     — underscore → dot  (for lora_unet_ / lycoris_ / lora_transformer_)
-
-    Returns None for paths that cannot be mapped (e.g. img_in, final_layer).
-    """
     # ── Step 0: underscore formats → dot format ───────────────────
-    und_prefix = None
+    stripped_prefix = None
     for pf in ["lora_transformer_", "lora_unet_", "lycoris_"]:
         if path.startswith(pf):
-            und_prefix = pf
+            path = path[len(pf):].replace("_", ".")
+            stripped_prefix = pf
             break
-    if und_prefix is not None:
-        rest = path[len(und_prefix):]
-        path = rest.replace("_", ".")
 
-    # ── Step 1: normalize prefix → diffusion_model.blocks.N ────────
-    if path.startswith("transformer."):
-        rest = path[len("transformer."):]
-        if rest.startswith("img_in") or rest.startswith("final_layer"):
-            return None
-        if rest.startswith("text_fusion.layerwise_blocks."):
-            rest = rest[len("text_fusion.layerwise_blocks."):]
-        elif rest.startswith("blocks."):
-            rest = rest[len("blocks."):]
-        else:
-            return None
-        path = f"diffusion_model.blocks.{rest}"
-    elif path.startswith("diffusion_model."):
-        pass
-    elif path.startswith("blocks."):
-        path = f"diffusion_model.{path}"
-    else:
+    if stripped_prefix is None:
+        if path.startswith("transformer."):
+            path = path[len("transformer."):]
+            stripped_prefix = "transformer."
+        elif path.startswith("diffusion_model."):
+            path = path[len("diffusion_model."):]
+            stripped_prefix = "diffusion_model."
+
+    # ── Step 1: excluded layers ──────────────────────────────────
+    if path.startswith("img_in") or path.startswith("final_layer"):
         return None
 
-    # ── Step 2: normalize block type  .ff. → .mlp. ───────────────
-    path = path.replace(".ff.", ".mlp.")
+    # ── Step 2: sub-structure → blocks ───────────────────────────
+    if path.startswith("text_fusion.layerwise_blocks."):
+        path = "blocks." + path[len("text_fusion.layerwise_blocks."):]
 
-    # ── Step 3: normalize suffixes ────────────────────────────────
+    for old, new in [
+        ("layers.", "blocks."),
+        ("joint_blocks.", "blocks."),
+        ("transformer_blocks.", "blocks."),
+        ("double_blocks.", "blocks."),
+        ("single_blocks.", "blocks."),
+    ]:
+        if path.startswith(old):
+            path = new + path[len(old):]
+            break
+
+    # ── Step 3: block type normalization ─────────────────────────
+    path = path.replace(".ff.", ".mlp.")
+    path = path.replace(".feed_forward.", ".mlp.")
+
+    # ── Step 4: substructure within attention ───────────────────
+    path = path.replace(".img_attn.", ".attn.")
+    path = path.replace(".txt_attn.", ".attn.")
+    path = path.replace(".attention.", ".attn.")
+
+    # ── Step 5: suffix normalization ────────────────────────────
     path = path.replace(".to_q", ".wq")
     path = path.replace(".to_k", ".wk")
     path = path.replace(".to_v", ".wv")
@@ -58,27 +65,32 @@ def _normalize_layer_path(path: str) -> str | None:
     path = path.replace(".to_out", ".wo")
     path = path.replace(".to_gate", ".gate")
 
-    return path
+    path = path.replace(".q_proj", ".wq")
+    path = path.replace(".k_proj", ".wk")
+    path = path.replace(".v_proj", ".wv")
+    path = path.replace(".out_proj", ".wo")
+
+    path = path.replace(".self_attn.q", ".attn.wq")
+    path = path.replace(".self_attn.k", ".attn.wk")
+    path = path.replace(".self_attn.v", ".attn.wv")
+    path = path.replace(".self_attn.o", ".attn.wo")
+
+    # Z-image: attention output is named "out" (not "wo")
+    path = path.replace(".attn.out", ".attn.wo")
+
+    return f"diffusion_model.{path}"
 
 
 def _auto_detect_format(sd: dict) -> str:
-    """Detect LoRA key format: 'standard', 'bfl', or 'unknown'."""
     for key in sd:
         if "single_blocks" in key or "double_blocks" in key:
             return "bfl"
-        if "diffusion_model.blocks" in key:
+        if "diffusion_model.blocks" in key or "diffusion_model.layers" in key:
             return "standard"
     return "unknown"
 
 
 def _convert_bfl_to_standard(sd: dict) -> dict:
-    """Convert BFL-format LoRA keys to standard ComfyUI format.
-
-    BFL: single_blocks.0.attn.qkv.lora_A.weight
-      →  diffusion_model.blocks.0.attn.qkv.lora_up.weight
-
-    lora_A = down projection, lora_B = up projection.
-    """
     out = {}
     for key, tensor in sd.items():
         if "qkv.lora" in key or "proj.lora" in key or "ff.lora" in key:
