@@ -37,6 +37,16 @@ class WINT4LoRALoader:
             raise FileNotFoundError(f"[WINT4 LoRA] LoRA '{lora_name}' not found.")
 
         log.info(f"[WINT4 LoRA] Loading: {lora_name} (strength={strength})")
+
+        # ── Reset stale LoRA entries on first load of this prompt ─
+        diffusion_model = model.model.diffusion_model
+        if getattr(model.model, '_lora_needs_reset', False):
+            for module in diffusion_model.modules():
+                if hasattr(module, '_lora_entries'):
+                    object.__setattr__(module, '_lora_entries', {})
+            object.__setattr__(model.model, '_wint4_loras', [])
+            object.__setattr__(model.model, '_lora_needs_reset', False)
+
         lora_sd = comfy.utils.load_torch_file(lora_path, safe_load=True)
 
         fmt = _auto_detect_format(lora_sd)
@@ -71,7 +81,6 @@ class WINT4LoRALoader:
                 if lp is None: continue
                 lora_data.setdefault(lp, {})["alpha"] = float(tensor.mean()) if tensor.numel() > 1 else tensor.item()
 
-        diffusion_model = model.model.diffusion_model
         applied = 0
 
         for mod_name, module in diffusion_model.named_modules():
@@ -125,7 +134,6 @@ class WINT4LoRALoader:
                     lora_entries = {}
                     object.__setattr__(module, '_lora_entries', lora_entries)
 
-                # Clear old entries for this lora_name
                 lora_entries.pop(lora_name, None)
 
                 entry = (A, B, multiplier) if sl_start is None else (A, B, multiplier, sl_start, sl_end)
@@ -138,12 +146,22 @@ class WINT4LoRALoader:
             object.__setattr__(model.model, '_wint4_loras', [])
         model.model._wint4_loras.append({"name": lora_name, "strength": strength, "path": lora_path})
 
+        # ── Prune stale entries (LoRAs no longer in the chain) ──
+        active_names = {entry["name"] for entry in model.model._wint4_loras}
+        for module in diffusion_model.modules():
+            entries = getattr(module, '_lora_entries', None)
+            if entries:
+                for stale in list(entries.keys()):
+                    if stale not in active_names:
+                        del entries[stale]
+
         if applied > 0:
             log.info(f"[WINT4 LoRA] ✓ Loaded: {lora_name} → {applied} INT4 layers")
         else:
             log.warning(f"[WINT4 LoRA] ✗ NOT applied: {lora_name} — 0 INT4 layers matched (format: {fmt})")
 
         return (model,)
+
 
 NODE_CLASS_MAPPINGS = {"WINT4LoRALoader": WINT4LoRALoader}
 NODE_DISPLAY_NAME_MAPPINGS = {"WINT4LoRALoader": "WINT4 LoRA Loader"}

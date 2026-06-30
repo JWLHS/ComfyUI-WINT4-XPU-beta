@@ -6,6 +6,12 @@ Standalone INT4 model quantizer node for ComfyUI.
 Per-row INT4 quantization with manual uint8 packing (2×4bit per byte).
 Supports input: BF16 / FP16 / FP8 / INT8 → output: INT4 packed uint8.
 Same exclusion list & QuaRot support as INT8.
+
+Features:
+  - Odd in_features auto-padded to even before packing
+  - Auto-creates output subdirectories (e.g. int4/my_model)
+  - Cleans up FP8 residual keys from source model
+  - Multi-device: XPU / CUDA / MPS / CPU
 """
 
 import os
@@ -85,6 +91,8 @@ def _get_available_devices() -> list[str]:
         choices.append("xpu")
     if torch.cuda.is_available():
         choices.append("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        choices.append("mps")
     return choices
 
 
@@ -95,6 +103,8 @@ def _resolve_device(requested: str) -> torch.device:
         return torch.device("xpu")
     if torch.cuda.is_available():
         return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
@@ -142,11 +152,11 @@ class WINT4ModelQuantizer:
                 }),
                 "device": (devices, {
                     "default": device_default,
-                    "tooltip": "Device used during quantization.",
+                    "tooltip": "Device used during quantization.  Supports XPU / CUDA / MPS / CPU.",
                 }),
                 "output_filename": ("STRING", {
                     "default": "model_int4",
-                    "tooltip": "Saved to ComfyUI/output/",
+                    "tooltip": "Saved to ComfyUI/output/.  Supports subdirectories (e.g. int4/my_model).",
                 }),
             },
         }
@@ -172,6 +182,11 @@ class WINT4ModelQuantizer:
 
         output_dir = folder_paths.get_output_directory()
         dst_path = os.path.join(output_dir, f"{output_filename}.safetensors")
+
+        # ── Create subdirectories if needed ─────────────────────────
+        dst_dir = os.path.dirname(dst_path)
+        if dst_dir and not os.path.isdir(dst_dir):
+            os.makedirs(dst_dir, exist_ok=True)
 
         dev = _resolve_device(device)
         log.info(f"[WINT4 Quantizer] Device: {dev}  (per-row INT4)")
@@ -229,6 +244,11 @@ class WINT4ModelQuantizer:
             scale = (amax / 7.0).clamp(min=1e-8)
             q = (w / scale).round().clamp(-8, 7).add(8).to(torch.uint8)
 
+            # ── Handle odd in_features: pad to even ────────────────
+            pad_dim = q.shape[1] % 2
+            if pad_dim:
+                q = torch.cat([q, torch.zeros(q.shape[0], 1, dtype=torch.uint8, device=q.device)], dim=1)
+
             # Pack: 偶数列低4位，奇数列高4位 → uint8
             q_packed = (q[:, 0::2] & 0x0F) | ((q[:, 1::2] & 0x0F) << 4)
 
@@ -252,6 +272,14 @@ class WINT4ModelQuantizer:
                 (torch.xpu if dev.type == "xpu" else torch.cuda).empty_cache()
             except Exception:
                 pass
+
+        # ── Clean up FP8 residual keys from source model ─────────────
+        for k in list(sd.keys()):
+            v = sd[k]
+            if isinstance(v, torch.Tensor) and v.dtype in (
+                torch.float8_e4m3fn, torch.float8_e5m2,
+            ):
+                del sd[k]
 
         sd["int4_quantized"] = torch.tensor(1, dtype=torch.uint8)
         sd["int4_model_type"] = _str_to_uint8_tensor(model_type)

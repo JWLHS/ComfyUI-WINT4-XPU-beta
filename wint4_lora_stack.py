@@ -53,11 +53,11 @@ class WINT4LoRAStack:
 
         diffusion_model = model.model.diffusion_model
 
-        # ── Clear ALL old LoRA entries across all modules ──────────
-        # (Stack replaces everything)
+        # ── Stack replaces everything: clear all entries + lora list ─
         for module in diffusion_model.modules():
             if hasattr(module, '_lora_entries'):
                 object.__setattr__(module, '_lora_entries', {})
+        object.__setattr__(model.model, '_wint4_loras', [])
 
         total_applied = 0
 
@@ -142,6 +142,9 @@ class WINT4LoRAStack:
 
             del lora_sd, lora_data
 
+            # ── Track active LoRAs ──────────────────────────────
+            model.model._wint4_loras.append({"name": lora_name, "strength": strength, "path": lora_path})
+
             if layer_applied > 0:
                 log.info(f"[WINT4 LoRA Stack] ✓ Loaded: {lora_name} → {layer_applied} layers")
             else:
@@ -149,6 +152,7 @@ class WINT4LoRAStack:
 
         log.info(f"[WINT4 LoRA Stack] Total: {total_applied} entries across {len(to_apply)} LoRAs.")
         return (model,)
+
 
 NODE_CLASS_MAPPINGS = {"WINT4LoRAStack": WINT4LoRAStack}
 NODE_DISPLAY_NAME_MAPPINGS = {"WINT4LoRAStack": "WINT4 LoRA Stack"}
