@@ -53,7 +53,7 @@ class WINT4LoRAStack:
 
         diffusion_model = model.model.diffusion_model
 
-        # ── Stack replaces everything: clear all entries + lora list ─
+        # ── Stack replaces everything ──────────────────────────
         for module in diffusion_model.modules():
             if hasattr(module, '_lora_entries'):
                 object.__setattr__(module, '_lora_entries', {})
@@ -71,8 +71,22 @@ class WINT4LoRAStack:
                 log.info(f"[WINT4 LoRA Stack] Converted BFL → standard")
 
             lora_data: dict[str, dict] = {}
+            is_lokr = False
             for key, tensor in lora_sd.items():
-                if "lora_up" in key or "lora_B" in key:
+                if "lokr_w1" in key:
+                    is_lokr = True
+                    idx = key.index("lokr_w1")
+                    lp = key[:idx].rstrip(".")
+                    lp = _normalize_layer_path(lp)
+                    if lp is None: continue
+                    lora_data.setdefault(lp, {})["lokr_w1"] = tensor
+                elif "lokr_w2" in key:
+                    idx = key.index("lokr_w2")
+                    lp = key[:idx].rstrip(".")
+                    lp = _normalize_layer_path(lp)
+                    if lp is None: continue
+                    lora_data.setdefault(lp, {})["lokr_w2"] = tensor
+                elif "lora_up" in key or "lora_B" in key:
                     idx = key.index("lora_up") if "lora_up" in key else key.index("lora_B")
                     lp = key[:idx].rstrip(".")
                     lp = _normalize_layer_path(lp)
@@ -89,6 +103,9 @@ class WINT4LoRAStack:
                     lp = _normalize_layer_path(lp)
                     if lp is None: continue
                     lora_data.setdefault(lp, {})["alpha"] = (tensor.item() if tensor.numel() == 1 else float(tensor.mean()))
+
+            if is_lokr:
+                log.info(f"[WINT4 LoRA Stack] Detected LyCORIS LoKr format: {lora_name}")
 
             layer_applied = 0
             for mod_name, module in diffusion_model.named_modules():
@@ -113,6 +130,40 @@ class WINT4LoRAStack:
                 if info is not None: candidates.append((info, None, None))
 
                 for info, sl_start, sl_end in candidates:
+                    # ── LoKr path ──────────────────────────────
+                    if "lokr_w1" in info and "lokr_w2" in info:
+                        w1 = info["lokr_w1"]
+                        w2 = info["lokr_w2"]
+                        factor = w1.shape[0]
+                        alpha = info.get("alpha", factor)
+                        multiplier = alpha / max(factor, 1) * strength
+
+                        w1 = w1.to(dev, dtype=torch.float16)
+                        w2 = w2.to(dev, dtype=torch.float16)
+
+                        if getattr(module, '_use_quarot', False):
+                            H = getattr(module, '_hadamard_H', None)
+                            gs = getattr(module, '_group_size', 128)
+                            if H is not None and gs > 0 and w2.shape[1] % gs == 0:
+                                H_dev = H.to(dev, dtype=torch.float16)
+                                n_groups = w2.shape[1] // gs
+                                w2 = (w2.reshape(w2.shape[0], n_groups, gs) @ H_dev.T).reshape(w2.shape[0], w2.shape[1])
+
+                        lora_entries = getattr(module, '_lora_entries', None)
+                        if lora_entries is None:
+                            lora_entries = {}
+                            object.__setattr__(module, '_lora_entries', lora_entries)
+
+                        if sl_start is None:
+                            entry = ("lokr", w1, w2, multiplier, factor)
+                        else:
+                            entry = ("lokr", w1, w2, multiplier, factor, sl_start, sl_end)
+                        lora_entries.setdefault(lora_name, []).append(entry)
+                        layer_applied += 1
+                        total_applied += 1
+                        continue
+
+                    # ── Standard LoRA path ─────────────────────
                     up, down = info.get("up"), info.get("down")
                     if up is None or down is None: continue
                     rank = up.shape[1]
@@ -142,7 +193,6 @@ class WINT4LoRAStack:
 
             del lora_sd, lora_data
 
-            # ── Track active LoRAs ──────────────────────────────
             model.model._wint4_loras.append({"name": lora_name, "strength": strength, "path": lora_path})
 
             if layer_applied > 0:

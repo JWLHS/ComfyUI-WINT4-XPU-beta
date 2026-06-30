@@ -11,6 +11,9 @@ Packed INT4 inference (uint8 storage, 2×4bit per byte):
 LoRA: via _lora_entries dict {lora_name: [(A,B,multiplier[,start,end]), ...]}.
 A = down projection (rank, in_f), B = up projection (out_f, rank).
 Stored on XPU.  Forward computes delta = B @ A on-the-fly.
+
+LoKr: entry = ("lokr", w1, w2, multiplier, factor[, start, end]).
+Dynamic Kronecker expansion in forward pass.
 """
 import json
 import logging
@@ -143,11 +146,10 @@ if _COMFY_OPS:
                 out_f = weight_u8.shape[0]
                 in_f = weight_u8.shape[1] * 2
 
-                w_low = (weight_u8 & 0x0F).to(torch.float16)
-                w_high = ((weight_u8 >> 4) & 0x0F).to(torch.float16)
-                w_unpacked = torch.cat([w_low.unsqueeze(-1), w_high.unsqueeze(-1)], dim=-1)
-                del w_low, w_high
-                w_unpacked = w_unpacked.reshape(out_f, in_f).sub_(8.0)
+                # Optimized unpack: single target tensor, stride write, no cat/reshape
+                w_unpacked = torch.empty(out_f, in_f, dtype=torch.float16, device=weight_u8.device)
+                w_unpacked[:, 0::2] = (weight_u8 & 0x0F).to(torch.float16).sub_(8.0)
+                w_unpacked[:, 1::2] = ((weight_u8 >> 4) & 0x0F).to(torch.float16).sub_(8.0)
 
                 if self._use_quarot and self._hadamard_H is not None:
                     try:
@@ -162,12 +164,33 @@ if _COMFY_OPS:
                     w_dq = w_unpacked.mul(w_scale).to(comp_dtype)
                 del w_unpacked
 
-                # ── WINT4 LoRA: delta = B @ A on XPU ──────────────
-                # _lora_entries = dict { lora_name: [(A,B,mult,...), ...] }
+                # ── WINT4 LoRA ───────────────────────────────────
                 lora_entries = getattr(self, '_lora_entries', None)
                 if lora_entries is not None:
                     for entries_list in lora_entries.values():
                         for entry in entries_list:
+                            # ── LoKr dynamic delta ─────────
+                            if isinstance(entry[0], str) and entry[0] == "lokr":
+                                _, w1, w2, multiplier, factor = entry[:5]
+                                sl_start = entry[5] if len(entry) > 5 else None
+                                sl_end   = entry[6] if len(entry) > 6 else None
+
+                                out_f_w2, in_f_w2 = w2.shape
+                                w1_dev = w1.to(device=w_dq.device, dtype=comp_dtype)
+                                w2_dev = w2.to(device=w_dq.device, dtype=comp_dtype)
+                                w1_exp = w1_dev.repeat_interleave(out_f_w2 // factor, dim=0).repeat_interleave(in_f_w2 // factor, dim=1)
+                                delta_dev = (w1_exp * w2_dev).mul_(multiplier)
+
+                                if delta_dev.shape[0] != w_dq.shape[0] or delta_dev.shape[1] != w_dq.shape[1]:
+                                    continue
+
+                                if sl_start is not None:
+                                    w_dq[sl_start:sl_end, :].add_(delta_dev)
+                                else:
+                                    w_dq.add_(delta_dev)
+                                continue
+
+                            # ── Standard LoRA ──────────────
                             A, B, multiplier = entry[:3]
                             sl_start = entry[3] if len(entry) > 3 else None
                             sl_end   = entry[4] if len(entry) > 4 else None

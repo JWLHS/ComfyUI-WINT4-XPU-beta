@@ -38,7 +38,6 @@ class WINT4LoRALoader:
 
         log.info(f"[WINT4 LoRA] Loading: {lora_name} (strength={strength})")
 
-        # ── Reset stale LoRA entries on first load of this prompt ─
         diffusion_model = model.model.diffusion_model
         if getattr(model.model, '_lora_needs_reset', False):
             for module in diffusion_model.modules():
@@ -62,8 +61,22 @@ class WINT4LoRALoader:
             dev = torch.device("cpu")
 
         lora_data: dict[str, dict] = {}
+        is_lokr = False
         for key, tensor in lora_sd.items():
-            if "lora_up" in key or "lora_B" in key:
+            if "lokr_w1" in key:
+                is_lokr = True
+                idx = key.index("lokr_w1")
+                lp = key[:idx].rstrip(".")
+                lp = _normalize_layer_path(lp)
+                if lp is None: continue
+                lora_data.setdefault(lp, {})["lokr_w1"] = tensor
+            elif "lokr_w2" in key:
+                idx = key.index("lokr_w2")
+                lp = key[:idx].rstrip(".")
+                lp = _normalize_layer_path(lp)
+                if lp is None: continue
+                lora_data.setdefault(lp, {})["lokr_w2"] = tensor
+            elif "lora_up" in key or "lora_B" in key:
                 idx = key.index("lora_up") if "lora_up" in key else key.index("lora_B")
                 lp = key[:idx].rstrip(".")
                 lp = _normalize_layer_path(lp)
@@ -80,6 +93,9 @@ class WINT4LoRALoader:
                 lp = _normalize_layer_path(lp)
                 if lp is None: continue
                 lora_data.setdefault(lp, {})["alpha"] = float(tensor.mean()) if tensor.numel() > 1 else tensor.item()
+
+        if is_lokr:
+            log.info(f"[WINT4 LoRA] Detected LyCORIS LoKr format")
 
         applied = 0
 
@@ -110,6 +126,41 @@ class WINT4LoRALoader:
                 candidates.append((info, None, None))
 
             for info, sl_start, sl_end in candidates:
+                # ── LoKr path ──────────────────────────────────
+                if "lokr_w1" in info and "lokr_w2" in info:
+                    w1 = info["lokr_w1"]
+                    w2 = info["lokr_w2"]
+                    factor = w1.shape[0]
+                    alpha = info.get("alpha", factor)
+                    multiplier = alpha / max(factor, 1) * strength
+
+                    w1 = w1.to(dev, dtype=torch.float16)
+                    w2 = w2.to(dev, dtype=torch.float16)
+
+                    # QuaRot rotation on w2
+                    if getattr(module, '_use_quarot', False):
+                        H = getattr(module, '_hadamard_H', None)
+                        gs = getattr(module, '_group_size', 128)
+                        if H is not None and gs > 0 and w2.shape[1] % gs == 0:
+                            H_dev = H.to(dev, dtype=torch.float16)
+                            n_groups = w2.shape[1] // gs
+                            w2 = (w2.reshape(w2.shape[0], n_groups, gs) @ H_dev.T).reshape(w2.shape[0], w2.shape[1])
+
+                    lora_entries = getattr(module, '_lora_entries', None)
+                    if lora_entries is None:
+                        lora_entries = {}
+                        object.__setattr__(module, '_lora_entries', lora_entries)
+
+                    lora_entries.pop(lora_name, None)
+                    if sl_start is None:
+                        entry = ("lokr", w1, w2, multiplier, factor)
+                    else:
+                        entry = ("lokr", w1, w2, multiplier, factor, sl_start, sl_end)
+                    lora_entries[lora_name] = [entry]
+                    applied += 1
+                    continue
+
+                # ── Standard LoRA path ─────────────────────────
                 up, down = info.get("up"), info.get("down")
                 if up is None or down is None: continue
                 rank = up.shape[1]
@@ -128,14 +179,12 @@ class WINT4LoRALoader:
                         n_groups = A.shape[1] // gs
                         A = (A.reshape(A.shape[0], n_groups, gs) @ H_dev.T).reshape(A.shape[0], A.shape[1])
 
-                # ── lora_name-keyed dict ──────────────────────────
                 lora_entries = getattr(module, '_lora_entries', None)
                 if lora_entries is None:
                     lora_entries = {}
                     object.__setattr__(module, '_lora_entries', lora_entries)
 
                 lora_entries.pop(lora_name, None)
-
                 entry = (A, B, multiplier) if sl_start is None else (A, B, multiplier, sl_start, sl_end)
                 lora_entries[lora_name] = [entry]
                 applied += 1
@@ -146,7 +195,7 @@ class WINT4LoRALoader:
             object.__setattr__(model.model, '_wint4_loras', [])
         model.model._wint4_loras.append({"name": lora_name, "strength": strength, "path": lora_path})
 
-        # ── Prune stale entries (LoRAs no longer in the chain) ──
+        # ── Prune stale entries ───────────────────────────────
         active_names = {entry["name"] for entry in model.model._wint4_loras}
         for module in diffusion_model.modules():
             entries = getattr(module, '_lora_entries', None)

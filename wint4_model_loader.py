@@ -5,7 +5,6 @@ WINT4 Model Loader node for ComfyUI.
 
 Loads an INT4-quantized (packed uint8) diffusion model using Int4XPUOps.
 """
-
 import logging
 import folder_paths
 import comfy.sd
@@ -62,6 +61,19 @@ class WINT4ModelLoader:
             f"[WINT4 Loader] Loading: {unet_name} (type={model_type})"
         )
         model = comfy.sd.load_diffusion_model(unet_path, model_options=model_options)
+
+        # ── Mark model for LoRA reset on next load ───────────────
+        object.__setattr__(model.model, '_lora_needs_reset', True)
+
+        # ── Patch detach to clear _lora_entries before offload ──
+        _orig_detach = model.detach
+        def _detach_with_cleanup(unpatch_all=True):
+            dm = model.model.diffusion_model
+            for module in dm.modules():
+                if hasattr(module, '_lora_entries'):
+                    object.__setattr__(module, '_lora_entries', {})
+            return _orig_detach(unpatch_all)
+        object.__setattr__(model, 'detach', _detach_with_cleanup)
 
         log.info(
             f"[WINT4 Loader] Loaded '{unet_name}' | type={model_type} "
