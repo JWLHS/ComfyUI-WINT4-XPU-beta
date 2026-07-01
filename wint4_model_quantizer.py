@@ -10,7 +10,7 @@ Same exclusion list & QuaRot support as INT8.
 Features:
   - Odd in_features auto-padded to even before packing
   - Auto-creates output subdirectories (e.g. int4/my_model)
-  - Cleans up FP8 residual keys from source model
+  - Converts residual FP8 tensors to FP16 for XPU compatibility
   - Multi-device: XPU / CUDA / MPS / CPU
 """
 
@@ -48,7 +48,8 @@ _EXCLUSIONS = {
     ],
     "wan": [
         "patch_embedding", "text_embedding", "time_embedding",
-        "time_projection", "head", "img_emb",
+        "time_projection", "head", "img_emb", "motion_encoder",
+        "modulation", "norm_q", "norm_k", "norm3",
     ],
     "ltx2": [
         "adaln_single", "audio_adaln_single", "audio_caption_projection",
@@ -249,7 +250,7 @@ class WINT4ModelQuantizer:
             if pad_dim:
                 q = torch.cat([q, torch.zeros(q.shape[0], 1, dtype=torch.uint8, device=q.device)], dim=1)
 
-            # Pack: 偶数列低4位，奇数列高4位 → uint8
+            # Pack: low nibble = even column, high nibble = odd column
             q_packed = (q[:, 0::2] & 0x0F) | ((q[:, 1::2] & 0x0F) << 4)
 
             base = key.rsplit(".weight", 1)[0]
@@ -273,13 +274,20 @@ class WINT4ModelQuantizer:
             except Exception:
                 pass
 
-        # ── Clean up FP8 residual keys from source model ─────────────
+        # ── Clean up residual FP8 tensors ──────────────────────────
         for k in list(sd.keys()):
             v = sd[k]
             if isinstance(v, torch.Tensor) and v.dtype in (
                 torch.float8_e4m3fn, torch.float8_e5m2,
             ):
-                del sd[k]
+                # Already-quantized weight → remove stale FP8 copy
+                if k.endswith('.weight'):
+                    base = k.rsplit('.weight', 1)[0]
+                    if f"{base}.weight_scale" in sd:
+                        del sd[k]
+                        continue
+                # Unquantized residual → convert to FP16 for XPU compatibility
+                sd[k] = v.to(torch.float16)
 
         sd["int4_quantized"] = torch.tensor(1, dtype=torch.uint8)
         sd["int4_model_type"] = _str_to_uint8_tensor(model_type)

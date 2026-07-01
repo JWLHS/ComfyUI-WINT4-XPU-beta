@@ -8,10 +8,66 @@ Loads an INT4-quantized (packed uint8) diffusion model using Int4XPUOps.
 import logging
 import folder_paths
 import comfy.sd
+import comfy.model_detection
 
 log = logging.getLogger("WINT4-Loader")
 
 NODE_NAME = "WINT4 Model Loader"
+
+# ── preserve original detect_unet_config for monkey-patch ──
+_orig_detect_unet_config = comfy.model_detection.detect_unet_config
+
+
+def _detect_with_int4_fallback(state_dict, key_prefix, metadata=None):
+    """Wrapper: native detection first; INT4 Wan fallback if that fails."""
+    result = _orig_detect_unet_config(state_dict, key_prefix, metadata)
+    if result is not None:
+        return result
+
+    keys = list(state_dict.keys())
+    # Wan fingerprint: 5-D patch_embedding.weight  [dim, 16, 1, 2, 2]
+    pe_key = "{}patch_embedding.weight".format(key_prefix)
+    if pe_key not in keys:
+        return None
+    pe = state_dict[pe_key]
+    if pe.ndim != 5 or pe.shape[1] != 16:
+        return None
+
+    ffn_key = "{}blocks.0.ffn.0.weight".format(key_prefix)
+    if ffn_key not in keys:
+        return None
+
+    dim = int(pe.shape[0])
+    ffn_dim = int(state_dict[ffn_key].shape[0])
+    in_dim = int(pe.shape[1])
+    num_layers = comfy.model_detection.count_blocks(
+        keys, "{}blocks.".format(key_prefix) + "{}."
+    )
+
+    out_dim = 16
+    dit_config = {
+        "image_model": "wan2.1",
+        "dim": dim,
+        "out_dim": out_dim,
+        "num_heads": dim // 128,
+        "ffn_dim": ffn_dim,
+        "num_layers": num_layers,
+        "patch_size": (1, 2, 2),
+        "freq_dim": 256,
+        "window_size": (-1, -1),
+        "qk_norm": True,
+        "cross_attn_norm": True,
+        "eps": 1e-6,
+        "in_dim": in_dim,
+    }
+
+    # subtype: i2v vs t2v (mirrors original detection logic)
+    if "{}img_emb.proj.0.bias".format(key_prefix) in keys:
+        dit_config["model_type"] = "i2v"
+    else:
+        dit_config["model_type"] = "t2v"
+
+    return dit_config
 
 
 class WINT4ModelLoader:
@@ -60,7 +116,13 @@ class WINT4ModelLoader:
         log.info(
             f"[WINT4 Loader] Loading: {unet_name} (type={model_type})"
         )
-        model = comfy.sd.load_diffusion_model(unet_path, model_options=model_options)
+
+        # ── monkey-patch detect_unet_config with INT4 fallback ──
+        comfy.model_detection.detect_unet_config = _detect_with_int4_fallback
+        try:
+            model = comfy.sd.load_diffusion_model(unet_path, model_options=model_options)
+        finally:
+            comfy.model_detection.detect_unet_config = _orig_detect_unet_config
 
         # ── Mark model for LoRA reset on next load ───────────────
         object.__setattr__(model.model, '_lora_needs_reset', True)

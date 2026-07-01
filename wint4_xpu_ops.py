@@ -62,6 +62,13 @@ if _COMFY_OPS:
                 meta_key = prefix + "comfy_quant"
                 input_scale_key = prefix + "input_scale"
 
+                # ── motion_encoder conv layers use "kernel" instead of "weight" ──
+                if weight_key not in state_dict:
+                    kernel_key = prefix + "kernel"
+                    if kernel_key in state_dict:
+                        weight_key = kernel_key
+                        scale_key = prefix + "kernel.weight_scale"
+
                 weight_tensor = state_dict.pop(weight_key, None)
                 weight_scale = state_dict.pop(scale_key, None)
                 meta_raw = state_dict.pop(meta_key, None)
