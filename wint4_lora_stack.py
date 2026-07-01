@@ -53,13 +53,18 @@ class WINT4LoRAStack:
 
         diffusion_model = model.model.diffusion_model
 
-        # ── Stack replaces everything ──────────────────────────
+        # ── Stack replaces everything ──────────────────
         for module in diffusion_model.modules():
             if hasattr(module, '_lora_entries'):
                 object.__setattr__(module, '_lora_entries', {})
+            bake_state = getattr(module, '_wint4_bake_state', None)
+            if bake_state is not None and '_orig_weight' in bake_state:
+                module.weight.data.copy_(bake_state['_orig_weight'])
+            object.__setattr__(module, '_wint4_bake_state', None)
         object.__setattr__(model.model, '_wint4_loras', [])
 
-        total_applied = 0
+        total_quantized = 0
+        total_bake = 0
 
         for lora_name, lora_path, strength in to_apply:
             log.info(f"[WINT4 LoRA Stack] Loading: {lora_name} (strength={strength})")
@@ -109,13 +114,14 @@ class WINT4LoRAStack:
 
             layer_applied = 0
             for mod_name, module in diffusion_model.named_modules():
-                if not getattr(module, '_is_quantized', False):
-                    continue
                 norm_name = _normalize_layer_path(mod_name)
-                if norm_name is None: continue
+                if norm_name is None:
+                    continue
+
+                is_quantized = getattr(module, '_is_quantized', False)
 
                 candidates = []
-                if norm_name.endswith(".attn.qkv"):
+                if norm_name.endswith(".attn.qkv") and hasattr(module, 'weight'):
                     out_f = module.weight.shape[0]
                     hs = out_f // 3
                     if hs * 3 == out_f:
@@ -124,14 +130,18 @@ class WINT4LoRAStack:
                         ]:
                             qkv_key = norm_name.replace(".attn.qkv", suffix)
                             info = lora_data.get(qkv_key)
-                            if info is not None: candidates.append((info, sl_start, sl_end))
+                            if info is not None:
+                                candidates.append((info, sl_start, sl_end, qkv_key))
 
                 info = lora_data.get(norm_name)
-                if info is not None: candidates.append((info, None, None))
+                if info is not None:
+                    candidates.append((info, None, None, norm_name))
 
-                for info, sl_start, sl_end in candidates:
-                    # ── LoKr path ──────────────────────────────
+                for info, sl_start, sl_end, lp_key in candidates:
+                    # ── LoKr (quantized only) ──────
                     if "lokr_w1" in info and "lokr_w2" in info:
+                        if not is_quantized:
+                            continue
                         w1 = info["lokr_w1"]
                         w2 = info["lokr_w2"]
                         factor = w1.shape[0]
@@ -154,22 +164,53 @@ class WINT4LoRAStack:
                             lora_entries = {}
                             object.__setattr__(module, '_lora_entries', lora_entries)
 
-                        if sl_start is None:
-                            entry = ("lokr", w1, w2, multiplier, factor)
-                        else:
-                            entry = ("lokr", w1, w2, multiplier, factor, sl_start, sl_end)
+                        entry = ("lokr", w1, w2, multiplier, factor) if sl_start is None else ("lokr", w1, w2, multiplier, factor, sl_start, sl_end)
                         lora_entries.setdefault(lora_name, []).append(entry)
                         layer_applied += 1
-                        total_applied += 1
+                        total_quantized += 1
                         continue
 
-                    # ── Standard LoRA path ─────────────────────
+                    # ── Standard LoRA ───────────────
                     up, down = info.get("up"), info.get("down")
-                    if up is None or down is None: continue
+                    if up is None or down is None:
+                        continue
                     rank = up.shape[1]
                     alpha = info.get("alpha", rank)
                     multiplier = alpha / max(rank, 1) * strength
 
+                    # ── Bake-in (non-quantized) ─────
+                    if not is_quantized:
+                        if not hasattr(module, 'weight') or module.weight is None:
+                            continue
+                        w = module.weight
+
+                        A = down.to(dev, dtype=torch.float16, non_blocking=True)
+                        B = up.to(dev, dtype=torch.float16, non_blocking=True)
+
+                        if getattr(module, '_use_quarot', False):
+                            H = getattr(module, '_hadamard_H', None)
+                            gs = getattr(module, '_group_size', 128)
+                            if H is not None and gs > 0 and A.shape[1] % gs == 0:
+                                H_dev = H.to(dev, dtype=torch.float16)
+                                n_groups = A.shape[1] // gs
+                                A = (A.reshape(A.shape[0], n_groups, gs) @ H_dev.T).reshape(A.shape[0], A.shape[1])
+
+                        delta = (B @ A).mul_(multiplier)
+                        if sl_start is not None:
+                            delta = delta[sl_start:sl_end, :]
+
+                        # Stack: 首个 LoRA 保存 orig，后续累积
+                        bake_state = getattr(module, '_wint4_bake_state', None)
+                        if bake_state is None:
+                            bake_state = {'_orig_weight': w.data.clone()}
+                            object.__setattr__(module, '_wint4_bake_state', bake_state)
+
+                        w.data.add_(delta.to(device=w.device))
+                        layer_applied += 1
+                        total_bake += 1
+                        continue
+
+                    # ── Quantized ───────────────────
                     A = down.to(dev, dtype=torch.float16, non_blocking=True)
                     B = up.to(dev, dtype=torch.float16, non_blocking=True)
 
@@ -189,7 +230,7 @@ class WINT4LoRAStack:
                     entry = (A, B, multiplier) if sl_start is None else (A, B, multiplier, sl_start, sl_end)
                     lora_entries.setdefault(lora_name, []).append(entry)
                     layer_applied += 1
-                    total_applied += 1
+                    total_quantized += 1
 
             del lora_sd, lora_data
 
@@ -200,7 +241,7 @@ class WINT4LoRAStack:
             else:
                 log.warning(f"[WINT4 LoRA Stack] ✗ NOT applied: {lora_name} — 0 layers matched (format: {fmt})")
 
-        log.info(f"[WINT4 LoRA Stack] Total: {total_applied} entries across {len(to_apply)} LoRAs.")
+        log.info(f"[WINT4 LoRA Stack] Total: {total_quantized} INT4 + {total_bake} bake-in across {len(to_apply)} LoRAs.")
         return (model,)
 
 

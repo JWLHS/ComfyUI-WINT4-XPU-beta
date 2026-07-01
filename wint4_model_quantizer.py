@@ -12,6 +12,8 @@ Features:
   - Auto-creates output subdirectories (e.g. int4/my_model)
   - Converts residual FP8 tensors to FP16 for XPU compatibility
   - Multi-device: XPU / CUDA / MPS / CPU
+  - Boogu: auto-uses group_size=32 for full QuaRot coverage
+  - Preserves source model metadata (config) for LTX/Wan version detection
 """
 
 import os
@@ -21,6 +23,7 @@ import logging
 import torch
 import folder_paths
 import comfy.utils
+from safetensors import safe_open
 
 from .wint8_quarot import build_hadamard, rotate_weight
 
@@ -57,6 +60,7 @@ _EXCLUSIONS = {
         "av_ca_a2v_gate_adaln_single", "av_ca_audio_scale_shift_adaln_single",
         "av_ca_v2a_gate_adaln_single", "av_ca_video_scale_shift_adaln_single",
         "caption_projection", "patchify_proj", "proj_out", "scale_shift_table",
+        "learnable_registers", "q_norm", "k_norm",
     ],
     "qwen": [
         "time_text_embed", "img_in", "norm_out", "proj_out", "txt_in",
@@ -149,7 +153,7 @@ class WINT4ModelQuantizer:
                 }),
                 "group_size": ("INT", {
                     "default": 128, "min": 64, "max": 256, "step": 64,
-                    "tooltip": "QuaRot group size. Recommended: 128.",
+                    "tooltip": "QuaRot group size. Boogu auto-overrides to 32.",
                 }),
                 "device": (devices, {
                     "default": device_default,
@@ -184,7 +188,6 @@ class WINT4ModelQuantizer:
         output_dir = folder_paths.get_output_directory()
         dst_path = os.path.join(output_dir, f"{output_filename}.safetensors")
 
-        # ── Create subdirectories if needed ─────────────────────────
         dst_dir = os.path.dirname(dst_path)
         if dst_dir and not os.path.isdir(dst_dir):
             os.makedirs(dst_dir, exist_ok=True)
@@ -195,11 +198,27 @@ class WINT4ModelQuantizer:
         sd = comfy.utils.load_torch_file(src_path, safe_load=True)
         log.info(f"[WINT4 Quantizer] Loaded {len(sd)} keys.")
 
+        # ── Preserve source metadata (config for LTX/Wan version detection) ──
+        src_metadata = {}
+        try:
+            with safe_open(src_path, framework="pt") as f:
+                src_metadata = f.metadata() or {}
+        except Exception:
+            pass
+
+        # ── Boogu: auto-override group_size to 32 for full coverage ──
         H = None
         quarot_applied = False
         if enable_quarot:
-            H = build_hadamard(group_size, device=str(dev), dtype=torch.float32)
-            log.info(f"[WINT4 Quantizer] QuaRot enabled, group_size={group_size}")
+            actual_gs = group_size
+            if model_type == "boogu":
+                actual_gs = 32
+                log.info(
+                    f"[WINT4 Quantizer] Boogu detected — group_size overridden "
+                    f"to {actual_gs} for full layer coverage"
+                )
+            H = build_hadamard(actual_gs, device=str(dev), dtype=torch.float32)
+            log.info(f"[WINT4 Quantizer] QuaRot enabled, group_size={actual_gs}")
 
         quantized_count = 0
         excluded_count = 0
@@ -215,7 +234,6 @@ class WINT4ModelQuantizer:
                     excluded_count += 1
                 continue
 
-            # ── Dequantize if input is INT8 ───────────────────────────
             if tensor.dtype == torch.int8:
                 base_key = key.rsplit(".weight", 1)[0]
                 scale_key = f"{base_key}.weight_scale"
@@ -232,25 +250,22 @@ class WINT4ModelQuantizer:
                 w = tensor.float().to(dev)
 
             layer_quarot = False
-            if H is not None and w.shape[1] % group_size == 0:
+            if H is not None and w.shape[1] % actual_gs == 0:
                 try:
-                    w = rotate_weight(w, H, group_size=group_size)
+                    w = rotate_weight(w, H, group_size=actual_gs)
                     layer_quarot = True
                     quarot_applied = True
                 except ValueError:
                     pass
 
-            # ── Per-row INT4 quantization ──────────────────────────
             amax = w.abs().amax(dim=1, keepdim=True)
             scale = (amax / 7.0).clamp(min=1e-8)
             q = (w / scale).round().clamp(-8, 7).add(8).to(torch.uint8)
 
-            # ── Handle odd in_features: pad to even ────────────────
             pad_dim = q.shape[1] % 2
             if pad_dim:
                 q = torch.cat([q, torch.zeros(q.shape[0], 1, dtype=torch.uint8, device=q.device)], dim=1)
 
-            # Pack: low nibble = even column, high nibble = odd column
             q_packed = (q[:, 0::2] & 0x0F) | ((q[:, 1::2] & 0x0F) << 4)
 
             base = key.rsplit(".weight", 1)[0]
@@ -259,7 +274,7 @@ class WINT4ModelQuantizer:
             sd[f"{base}.weight_scale"] = scale.cpu()
             sd[f"{base}.comfy_quant"] = _make_comfy_quant(
                 quarot=layer_quarot,
-                group_size=group_size if layer_quarot else None,
+                group_size=actual_gs if layer_quarot else None,
             )
             sd[f"{base}.input_scale"] = torch.tensor(1.0, dtype=torch.float32)
 
@@ -274,26 +289,28 @@ class WINT4ModelQuantizer:
             except Exception:
                 pass
 
-        # ── Clean up residual FP8 tensors ──────────────────────────
         for k in list(sd.keys()):
             v = sd[k]
             if isinstance(v, torch.Tensor) and v.dtype in (
                 torch.float8_e4m3fn, torch.float8_e5m2,
             ):
-                # Already-quantized weight → remove stale FP8 copy
                 if k.endswith('.weight'):
                     base = k.rsplit('.weight', 1)[0]
                     if f"{base}.weight_scale" in sd:
                         del sd[k]
                         continue
-                # Unquantized residual → convert to FP16 for XPU compatibility
                 sd[k] = v.to(torch.float16)
 
         sd["int4_quantized"] = torch.tensor(1, dtype=torch.uint8)
         sd["int4_model_type"] = _str_to_uint8_tensor(model_type)
 
+        # ── Save with source metadata preserved ──────────────────────
+        save_kwargs = {}
+        if src_metadata:
+            save_kwargs["metadata"] = src_metadata
+
         log.info(f"[WINT4 Quantizer] Writing {dst_path} ...")
-        comfy.utils.save_torch_file(sd, dst_path)
+        comfy.utils.save_torch_file(sd, dst_path, **save_kwargs)
 
         mb_before = total_before_bytes / (1024 * 1024)
         mb_after = total_after_bytes / (1024 * 1024)
@@ -308,10 +325,11 @@ class WINT4ModelQuantizer:
             f"  Output: {dst_path}\n"
             f"  {'='*60}"
         )
+        if src_metadata:
+            has_config = "config" in src_metadata
+            log.info(f"[WINT4 Quantizer] Source metadata preserved ({'with config' if has_config else 'no config'})")
         return ()
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _make_comfy_quant(quarot: bool = False, group_size: int | None = None) -> torch.Tensor:
     payload = {"format": "int4_tensorwise", "per_row": True}
@@ -324,8 +342,6 @@ def _make_comfy_quant(quarot: bool = False, group_size: int | None = None) -> to
 def _str_to_uint8_tensor(s: str) -> torch.Tensor:
     return torch.tensor(list(s.encode("utf-8")), dtype=torch.uint8)
 
-
-# ── Registration ──────────────────────────────────────────────────────────────
 
 NODE_CLASS_MAPPINGS = {"WINT4ModelQuantizer": WINT4ModelQuantizer}
 NODE_DISPLAY_NAME_MAPPINGS = {"WINT4ModelQuantizer": "WINT4 Model Quantizer"}
